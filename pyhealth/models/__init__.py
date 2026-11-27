@@ -183,3 +183,4 @@ from .game import (
     normalize_game_code as normalize_game_code,
 )
 from .query_focused_ehr import QueryFocusedEHRModel as QueryFocusedEHRModel
+from .uncertainty_rnn import UncertaintyRNN
