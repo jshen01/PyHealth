@@ -64,6 +64,9 @@ Usage:
 
 import argparse
 import random
+import inspect
+import tempfile
+from pyhealth.datasets.sample_dataset import create_sample_dataset
 from typing import List, Tuple
 
 import numpy as np
@@ -95,39 +98,48 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def build_synthetic_cohort(num_patients: int = 120, seed: int = 42) -> SampleDataset:
-    """Generates a deterministic synthetic ICU cohort for credential-free runs."""
-    rng = random.Random(seed)
-    diag_pool = ["401.9", "250.00", "428.0", "410.71", "584.9", "518.81", "038.9"]
-    proc_pool = ["96.04", "38.93", "96.71", "87.44", "99.60"]
-
-    samples = []
-    for idx in range(num_patients):
-        n_visits = rng.randint(1, 4)
-        conditions = [
-            rng.sample(diag_pool, k=rng.randint(1, 3)) for _ in range(n_visits)
-        ]
-        procedures = [
-            rng.sample(proc_pool, k=rng.randint(1, 2)) for _ in range(n_visits)
-        ]
-        high_risk = any("038.9" in visit or "410.71" in visit for visit in conditions)
-        mortality = 1 if (high_risk and rng.random() < 0.45) or rng.random() < 0.1 else 0
-        samples.append(
+def build_synthetic_cohort(num_samples: int = 64):
+    """Create a lightweight synthetic mortality cohort for quick smoke-testing."""
+    raw_samples = []
+    for i in range(num_samples):
+        is_positive = i % 2 == 1
+        raw_samples.append(
             {
-                "patient_id": f"synth_p{idx}",
-                "visit_id": f"synth_v{idx}",
-                "conditions": conditions,
-                "procedures": procedures,
-                "mortality": mortality,
+                "visit_id": f"v{i}",
+                "patient_id": f"p{i}",
+                "conditions": (
+                    ["584.9", "518.81", "995.92"]
+                    if is_positive
+                    else ["401.9", "250.00", "428.0"]
+                ),
+                "procedures": (
+                    ["39.95", "96.71"]
+                    if is_positive
+                    else ["96.04", "38.93"]
+                ),
+                "mortality": int(is_positive),
             }
         )
 
-    return SampleDataset(
-        samples=samples,
-        input_schema={"conditions": "nested_sequence", "procedures": "nested_sequence"},
-        output_schema={"mortality": "binary"},
-        dataset_name="synthetic_icu",
-    )
+    input_schema = {"conditions": "sequence", "procedures": "sequence"}
+    output_schema = {"mortality": "binary"}
+
+    sig = inspect.signature(create_sample_dataset)
+    kwargs = {
+        "samples": raw_samples,
+        "input_schema": input_schema,
+        "output_schema": output_schema,
+        "dataset_name": "synthetic_mortality",
+        "task_name": "mortality_prediction",
+    }
+    if "in_memory" in sig.parameters:
+        kwargs["in_memory"] = True
+    elif "cache_dir" in sig.parameters:
+        kwargs["cache_dir"] = tempfile.mkdtemp(prefix="pyhealth_synthetic_")
+    elif "path" in sig.parameters:
+        kwargs["path"] = tempfile.mkdtemp(prefix="pyhealth_synthetic_")
+
+    return create_sample_dataset(**kwargs)
 
 
 def build_mortality_dataset(
