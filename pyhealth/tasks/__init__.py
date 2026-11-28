@@ -73,6 +73,12 @@ from .physionet2012_forecasting import (
     physionet2012_benchmark_split as physionet2012_benchmark_split,
     physionet2012_statistics as physionet2012_statistics,
 )
+from .signal_forecasting import (
+    PTBXL_LEADS as PTBXL_LEADS,
+    SLEEPEDF_CHANNELS as SLEEPEDF_CHANNELS,
+    PTBXLForecasting as PTBXLForecasting,
+    SleepEDFForecasting as SleepEDFForecasting,
+)
 from .physionet2012_inhospital_mortality import (
     PhysioNet2012InHospitalMortality as PhysioNet2012InHospitalMortality,
     build_mortality_sample as build_mortality_sample,
@@ -108,6 +114,9 @@ from .ed_disposition_mimic4 import (
 from .ehr_cxr_mimic4 import (
     EHRCXRMortalityMIMIC4 as EHRCXRMortalityMIMIC4,
     EHRCXRPhenotypingMIMIC4 as EHRCXRPhenotypingMIMIC4,
+)
+from .prior_exam_preference import (
+    PriorExamPreferenceTask as PriorExamPreferenceTask,
 )
 from .maestro_mortality_mimic4 import (
     MAESTROMortalityMIMIC4 as MAESTROMortalityMIMIC4,
@@ -165,6 +174,11 @@ from .ethos_tasks import (
     EthosRolloutRule as EthosRolloutRule,
     EthosTimelineMEDS as EthosTimelineMEDS,
 )
+from .evicare_diagnosis import (
+    CCSMapping as CCSMapping,
+    EviCareDiagnosisPredictionMIMIC3 as EviCareDiagnosisPredictionMIMIC3,
+    EviCareDiagnosisPredictionMIMIC4 as EviCareDiagnosisPredictionMIMIC4,
+)
 from .msd_segmentation import MSDSegmentationTask as MSDSegmentationTask
 from .next_visit_diagnosis_prediction import (
     NextVisitDiagnosisPredictionMIMIC3 as NextVisitDiagnosisPredictionMIMIC3,
@@ -191,6 +205,9 @@ from .survival_time_to_event import (
 )
 from .survival_time_to_event import (
     SurvivalTimeToEventSupport2 as SurvivalTimeToEventSupport2,
+)
+from .multi_event_survival_rotterdam import (
+    MultiEventSurvivalRotterdam as MultiEventSurvivalRotterdam,
 )
 from .mortality_prediction_stagenet_mimic4 import (
     MortalityPredictionStageNetMIMIC4,
