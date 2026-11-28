@@ -1,11 +1,13 @@
-# Author: Donggyu Lee, Jinfeng Shen
-# Paper: Analyzing the Role of Model Uncertainty for Electronic Health Records
-# Link: https://arxiv.org/abs/1906.03842
-# Description: Variational Bayesian RNN (UncertaintyRNN) supporting deterministic,
-#              Bayesian embeddings, Bayesian output, and Bayesian hidden+output
-#              configurations for quantifying epistemic uncertainty on EHR data.
+"""Uncertainty-aware RNN models for Electronic Health Records (EHR).
 
-from typing import Dict, List, Optional
+Reference:
+    M. W. Dusenberry, D. Tran, E. Choi, J. Kemp, J. Nixon, G. Jerfel,
+    K. Heller, and A. M. Dai, "Analyzing the Role of Model Uncertainty
+    for Electronic Health Records," in Proc. ACM Conference on Health,
+    Inference, and Learning (CHIL '20), 2020, pp. 204-213.
+"""
+
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -14,15 +16,26 @@ import torch.nn.functional as F
 from pyhealth.datasets import SampleDataset
 from pyhealth.models import BaseModel
 
+VALID_UNCERTAINTY_TYPES = (
+    "deterministic",
+    "bayesian_embeddings",
+    "bayesian_output",
+    "bayesian_hidden_output",
+    "fully_bayesian",
+)
+
 
 class VariationalEmbedding(nn.Module):
-    """Mean-field variational embedding layer with Gaussian prior N(0, prior_std^2).
+    """Mean-field variational embedding layer with a Gaussian prior.
+
+    Places a factorized normal posterior ``N(weight_mu, softplus(weight_rho)^2)``
+    over discrete code embeddings with zero-mean Gaussian prior ``N(0, prior_std^2)``.
 
     Args:
-        num_embeddings: Size of the token vocabulary.
+        num_embeddings: Size of the vocabulary dictionary.
         embedding_dim: Dimensionality of each embedding vector.
-        prior_std: Standard deviation of the zero-mean isotropic Gaussian prior.
-        padding_idx: Token index excluded from sampling and KL regularization.
+        prior_std: Standard deviation of the isotropic Gaussian prior.
+        padding_idx: Index whose embedding gradient is masked out during padding.
     """
 
     def __init__(
@@ -30,7 +43,7 @@ class VariationalEmbedding(nn.Module):
         num_embeddings: int,
         embedding_dim: int,
         prior_std: float = 0.292,
-        padding_idx: Optional[int] = 0,
+        padding_idx: int = 0,
     ) -> None:
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -42,26 +55,25 @@ class VariationalEmbedding(nn.Module):
         self.weight_rho = nn.Parameter(torch.empty(num_embeddings, embedding_dim))
         nn.init.normal_(self.weight_mu, mean=0.0, std=0.05)
         nn.init.constant_(self.weight_rho, -3.0)
-        if self.padding_idx is not None:
-            with torch.no_grad():
-                self.weight_mu[self.padding_idx].fill_(0.0)
 
-    def forward(self, x: torch.Tensor, sample: bool = True) -> torch.Tensor:
-        if sample:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Samples embeddings via reparameterization and looks up indices.
+
+        Args:
+            x: Integer token tensor of shape ``[batch_size, ...]``.
+
+        Returns:
+            Embedded tensor of shape ``[batch_size, ..., embedding_dim]``.
+        """
+        if self.training or getattr(self, "mc_sample", True):
             sigma = F.softplus(self.weight_rho)
-            eps = torch.randn_like(sigma)
-            weight = self.weight_mu + sigma * eps
+            weight = self.weight_mu + sigma * torch.randn_like(sigma)
         else:
             weight = self.weight_mu
-
-        if self.padding_idx is not None:
-            weight = weight.clone()
-            weight[self.padding_idx] = 0.0
-
         return F.embedding(x, weight, padding_idx=self.padding_idx)
 
     def kl_divergence(self) -> torch.Tensor:
-        """Compute exact analytical KL[q(W) || p(W)] excluding padding_idx."""
+        """Computes analytical KL divergence ``KL(q(W) || p(W))``."""
         sigma = F.softplus(self.weight_rho)
         prior_var = self.prior_std ** 2
         kl = (
@@ -69,23 +81,17 @@ class VariationalEmbedding(nn.Module):
             + (sigma.pow(2) + self.weight_mu.pow(2)) / (2.0 * prior_var)
             - 0.5
         )
-        if self.padding_idx is not None:
-            mask = torch.ones(
-                self.num_embeddings, device=self.weight_mu.device, dtype=torch.bool
-            )
-            mask[self.padding_idx] = False
-            kl = kl[mask]
         return kl.sum()
 
 
 class VariationalLinear(nn.Module):
-    """Mean-field variational dense layer with Gaussian prior N(0, prior_std^2).
+    """Mean-field variational linear layer with a Gaussian prior.
 
     Args:
-        in_features: Number of input features.
-        out_features: Number of output features.
-        prior_std: Standard deviation of the zero-mean Gaussian prior.
-        bias_uncertainty: Whether to place a variational posterior on the bias.
+        in_features: Size of each input sample.
+        out_features: Size of each output sample.
+        prior_std: Standard deviation of the Gaussian weight prior.
+        bias_uncertainty: Whether to place a variational posterior on bias terms.
     """
 
     def __init__(
@@ -110,21 +116,26 @@ class VariationalLinear(nn.Module):
         else:
             self.register_parameter("bias_rho", None)
 
-    def forward(self, x: torch.Tensor, sample: bool = True) -> torch.Tensor:
-        if sample:
-            weight_sigma = F.softplus(self.weight_rho)
-            weight = self.weight_mu + weight_sigma * torch.randn_like(weight_sigma)
-            if self.bias_uncertainty:
-                bias_sigma = F.softplus(self.bias_rho)
-                bias = self.bias_mu + bias_sigma * torch.randn_like(bias_sigma)
-            else:
-                bias = self.bias_mu
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Applies an affine transformation using sampled variational weights.
+
+        Args:
+            x: Input tensor of shape ``[batch_size, in_features]``.
+
+        Returns:
+            Output tensor of shape ``[batch_size, out_features]``.
+        """
+        weight_sigma = F.softplus(self.weight_rho)
+        weight = self.weight_mu + weight_sigma * torch.randn_like(weight_sigma)
+        if self.bias_uncertainty:
+            bias_sigma = F.softplus(self.bias_rho)
+            bias = self.bias_mu + bias_sigma * torch.randn_like(bias_sigma)
         else:
-            weight = self.weight_mu
             bias = self.bias_mu
         return F.linear(x, weight, bias)
 
     def kl_divergence(self) -> torch.Tensor:
+        """Computes analytical KL divergence ``KL(q(W, b) || p(W, b))``."""
         sigma = F.softplus(self.weight_rho)
         prior_var = self.prior_std ** 2
         kl = (
@@ -132,7 +143,7 @@ class VariationalLinear(nn.Module):
             + (sigma.pow(2) + self.weight_mu.pow(2)) / (2.0 * prior_var)
             - 0.5
         ).sum()
-        if self.bias_uncertainty:
+        if self.bias_uncertainty and self.bias_rho is not None:
             b_sigma = F.softplus(self.bias_rho)
             kl += (
                 torch.log(self.prior_std / b_sigma)
@@ -143,70 +154,77 @@ class VariationalLinear(nn.Module):
 
 
 class UncertaintyRNN(BaseModel):
-    """PyHealth BaseModel implementation of Dusenberry et al. (ACM CHIL 2020) RNN.
+    """Recurrent neural network with deterministic and Bayesian uncertainty modes.
 
-    Supports deterministic training as well as variational Bayesian inference over
-    embeddings, output layer, or hidden + output layers.
+    Implements the clinical sequence architecture of Dusenberry et al. (2020),
+    supporting deterministic deep ensembles as well as four variational Bayesian
+    parameterizations trained via ELBO minimization with linear KL annealing.
 
     Args:
-        dataset: PyHealth SampleDataset defining feature and label schemas.
-        uncertainty_type: One of ``"deterministic"``, ``"bayesian_embeddings"``,
-            ``"bayesian_output"``, ``"bayesian_hidden_output"``, or
-            ``"fully_bayesian"``.
-        embedding_dim: Dimensionality of token embeddings.
-        rnn_dim: Hidden dimension of the LSTM encoder.
-        hidden_dim: Hidden dimension of the post-LSTM dense layer.
-        prior_std: Prior Gaussian standard deviation for variational weights.
-        annealing_steps: Number of training steps over which KL weight anneals
-            linearly from 0 to 1.
-        num_train_samples: Training set size N used to scale KL / N.
-    """
+        dataset: Processed PyHealth ``SampleDataset`` defining input/output schemas.
+        uncertainty_type: Uncertainty regime to instantiate. Must be one of
+            ``"deterministic"``, ``"bayesian_embeddings"``, ``"bayesian_output"``,
+            ``"bayesian_hidden_output"``, or ``"fully_bayesian"``.
+        embedding_dim: Dimension of per-feature code embeddings. Default is 32.
+        rnn_dim: Hidden state size of the LSTM sequence encoder. Default is 1024.
+        hidden_dim: Width of the post-LSTM dense hidden layer. Default is 512.
+        prior_std: Prior standard deviation for variational layers. Default is 0.292.
+        annealing_steps: Number of training steps over which KL weight ramps from
+            0.0 to 1.0. Default is 972200.
+        num_train_samples: Training set size used to scale the KL regularization
+            term in the ELBO objective. If ``None``, defaults to ``len(dataset)``.
 
-    VALID_TYPES = {
-        "deterministic",
-        "bayesian_embeddings",
-        "bayesian_output",
-        "bayesian_hidden_output",
-        "fully_bayesian",
-    }
+    Examples:
+        >>> from pyhealth.models import UncertaintyRNN
+        >>> model = UncertaintyRNN(
+        ...     dataset=sample_dataset,
+        ...     uncertainty_type="bayesian_embeddings",
+        ...     embedding_dim=32,
+        ...     rnn_dim=256,
+        ...     hidden_dim=128,
+        ... )
+        >>> outputs = model(**batch)
+        >>> loss, y_prob = outputs["loss"], outputs["y_prob"]
+    """
 
     def __init__(
         self,
         dataset: SampleDataset,
-        uncertainty_type: str = "bayesian_embeddings",
+        uncertainty_type: str = "deterministic",
         embedding_dim: int = 32,
         rnn_dim: int = 1024,
         hidden_dim: int = 512,
         prior_std: float = 0.292,
         annealing_steps: int = 972200,
-        num_train_samples: int = 30000,
+        num_train_samples: Optional[int] = None,
     ) -> None:
         super().__init__(dataset=dataset)
-        if uncertainty_type not in self.VALID_TYPES:
+        if uncertainty_type not in VALID_UNCERTAINTY_TYPES:
             raise ValueError(
-                f"Invalid uncertainty_type '{uncertainty_type}'. "
-                f"Expected one of {sorted(self.VALID_TYPES)}."
+                f"Unsupported uncertainty_type '{uncertainty_type}'. "
+                f"Choose from {VALID_UNCERTAINTY_TYPES}."
             )
 
         self.uncertainty_type = uncertainty_type
+        self.embedding_dim = embedding_dim
+        self.rnn_dim = rnn_dim
+        self.hidden_dim = hidden_dim
+        self.prior_std = prior_std
         self.annealing_steps = max(1, annealing_steps)
-        self.num_train_samples = max(1, num_train_samples)
+        self.num_train_samples = (
+            num_train_samples if num_train_samples is not None else max(1, len(dataset))
+        )
         self.register_buffer("global_step", torch.tensor(0, dtype=torch.long))
 
-        assert len(self.label_keys) == 1, "Only single label key is supported."
         self.label_key = self.label_keys[0]
-        self.output_size = self.get_output_size()
 
+        # 1. Feature embedding layers
         self.embeddings = nn.ModuleDict()
-        use_bayes_emb = uncertainty_type in {"bayesian_embeddings", "fully_bayesian"}
+        use_bayes_emb = uncertainty_type in ("bayesian_embeddings", "fully_bayesian")
 
         for feature_key in self.feature_keys:
             processor = self.dataset.input_processors[feature_key]
-            vocab_map = getattr(processor, "code_vocab", None) or getattr(
-                processor, "vocab", None
-            )
-            vocab_size = len(vocab_map)
-
+            vocab_size = len(processor.code_vocab)
             if use_bayes_emb:
                 self.embeddings[feature_key] = VariationalEmbedding(
                     vocab_size, embedding_dim, prior_std=prior_std, padding_idx=0
@@ -218,6 +236,7 @@ class UncertaintyRNN(BaseModel):
 
         total_emb_dim = len(self.feature_keys) * embedding_dim
 
+        # 2. Sequence encoder (LSTM)
         self.lstm = nn.LSTM(
             input_size=total_emb_dim,
             hidden_size=rnn_dim,
@@ -225,53 +244,58 @@ class UncertaintyRNN(BaseModel):
             batch_first=True,
         )
 
-        use_bayes_hidden = uncertainty_type in {
+        # 3. Hidden and output dense layers
+        use_bayes_hidden = uncertainty_type in (
             "bayesian_hidden_output",
             "fully_bayesian",
-        }
-        use_bayes_out = uncertainty_type in {
+        )
+        use_bayes_out = uncertainty_type in (
             "bayesian_output",
             "bayesian_hidden_output",
             "fully_bayesian",
-        }
+        )
 
-        self.hidden_layer = (
+        self.hidden_layer: nn.Module = (
             VariationalLinear(rnn_dim, hidden_dim, prior_std=prior_std)
             if use_bayes_hidden
             else nn.Linear(rnn_dim, hidden_dim)
         )
-        self.output_layer = (
-            VariationalLinear(hidden_dim, self.output_size, prior_std=prior_std)
+        self.output_layer: nn.Module = (
+            VariationalLinear(hidden_dim, 1, prior_std=prior_std)
             if use_bayes_out
-            else nn.Linear(hidden_dim, self.output_size)
+            else nn.Linear(hidden_dim, 1)
         )
 
     def total_kl_divergence(self) -> torch.Tensor:
-        """Sum analytical KL divergence across all variational modules."""
+        """Aggregates KL divergence across all variational submodules."""
         kl = torch.tensor(0.0, device=self.global_step.device)
         for module in self.modules():
             if hasattr(module, "kl_divergence"):
                 kl = kl + module.kl_divergence()
         return kl
 
-    def encode_sequence(self, sample: bool = True, **kwargs) -> torch.Tensor:
-        """Embed and concatenate multi-feature sequences with mismatched lengths."""
+    def encode_sequence(self, **kwargs: Any) -> torch.Tensor:
+        """Embeds, aligns, and encodes variable-length clinical feature sequences.
+
+        Args:
+            **kwargs: Batch dictionary mapping each ``feature_key`` to an integer
+                tensor of shape ``[batch_size, seq_len]`` or
+                ``[batch_size, seq_len, max_codes]``.
+
+        Returns:
+            Final valid LSTM hidden state tensor of shape ``[batch_size, rnn_dim]``.
+        """
         raw_tokens: Dict[str, torch.Tensor] = {}
         max_len = 0
 
         for feature_key in self.feature_keys:
-            tokens = kwargs[feature_key]
-            if not isinstance(tokens, torch.Tensor):
-                tokens = torch.tensor(tokens, dtype=torch.long, device=self.device)
-            else:
-                tokens = tokens.to(device=self.device, dtype=torch.long)
-
+            tokens = kwargs[feature_key].to(self.device).long()
             if tokens.dim() == 2:
                 tokens = tokens.unsqueeze(-1)
             raw_tokens[feature_key] = tokens
             max_len = max(max_len, tokens.size(1))
 
-        embedded_features: List[torch.Tensor] = []
+        embedded_features = []
         combined_mask: Optional[torch.Tensor] = None
 
         for feature_key in self.feature_keys:
@@ -287,37 +311,33 @@ class UncertaintyRNN(BaseModel):
                 else torch.maximum(combined_mask, step_mask)
             )
 
-            emb_layer = self.embeddings[feature_key]
-            if isinstance(emb_layer, VariationalEmbedding):
-                emb = emb_layer(tokens, sample=sample).sum(dim=-2)
-            else:
-                emb = emb_layer(tokens).sum(dim=-2)
+            emb = self.embeddings[feature_key](tokens).sum(dim=-2)
             embedded_features.append(emb)
 
         x = torch.cat(embedded_features, dim=-1)
         rnn_out, _ = self.lstm(x)
 
+        assert combined_mask is not None
         lengths = combined_mask.sum(dim=-1).clamp(min=1) - 1
         batch_indices = torch.arange(rnn_out.size(0), device=self.device)
         return rnn_out[batch_indices, lengths]
 
-    def _forward_logits(self, sample: bool = True, **kwargs) -> torch.Tensor:
-        h = self.encode_sequence(sample=sample, **kwargs)
-        if isinstance(self.hidden_layer, VariationalLinear):
-            h = F.relu(self.hidden_layer(h, sample=sample))
-        else:
-            h = F.relu(self.hidden_layer(h))
+    def forward(self, **kwargs: Any) -> Dict[str, torch.Tensor]:
+        """Runs a forward pass and computes NLL or annealed ELBO loss.
 
-        if isinstance(self.output_layer, VariationalLinear):
-            return self.output_layer(h, sample=sample)
-        return self.output_layer(h)
+        Args:
+            **kwargs: Batch dictionary containing all ``feature_keys`` and
+                ``label_key``.
 
-    def forward(self, **kwargs) -> Dict[str, torch.Tensor]:
-        """Compute task loss, annealed KL divergence, and predicted probabilities."""
-        logits = self._forward_logits(sample=True, **kwargs)
-        y_true = kwargs[self.label_key].to(self.device)
-        loss_fn = self.get_loss_function()
-        nll_loss = loss_fn(logits, y_true)
+        Returns:
+            Dictionary with keys ``"loss"``, ``"y_prob"``, and ``"y_true"``.
+        """
+        h = self.encode_sequence(**kwargs)
+        h = F.relu(self.hidden_layer(h))
+        logits = self.output_layer(h).squeeze(-1)
+
+        y_true = kwargs[self.label_key].to(self.device).float().view(-1)
+        nll_loss = F.binary_cross_entropy_with_logits(logits, y_true)
 
         if self.uncertainty_type != "deterministic":
             if self.training:
@@ -326,32 +346,7 @@ class UncertaintyRNN(BaseModel):
             kl_loss = (self.total_kl_divergence() / self.num_train_samples) * kl_weight
             loss = nll_loss + kl_loss
         else:
-            kl_loss = torch.tensor(0.0, device=self.device)
             loss = nll_loss
 
-        y_prob = self.prepare_y_prob(logits)
-        return {
-            "loss": loss,
-            "nll_loss": nll_loss,
-            "kl_loss": kl_loss,
-            "y_prob": y_prob,
-            "y_true": y_true,
-        }
-
-    @torch.no_grad()
-    def predict_uncertainty(
-        self, num_samples: int = 50, **kwargs
-    ) -> Dict[str, torch.Tensor]:
-        """Draw M Monte Carlo forward passes to quantify patient-level uncertainty."""
-        preds: List[torch.Tensor] = []
-        for _ in range(num_samples):
-            logits = self._forward_logits(sample=True, **kwargs)
-            preds.append(self.prepare_y_prob(logits))
-
-        stacked = torch.stack(preds, dim=0)
-        return {
-            "samples": stacked,
-            "mean": stacked.mean(dim=0),
-            "std": stacked.std(dim=0),
-            "range": stacked.max(dim=0).values - stacked.min(dim=0).values,
-        }
+        y_prob = torch.sigmoid(logits)
+        return {"loss": loss, "y_prob": y_prob, "y_true": y_true}

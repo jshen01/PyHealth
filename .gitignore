@@ -159,3 +159,6 @@ test-resources/meds_demo/
 # Generated Synthea outputs and dataset caches
 .artifacts/
 examples/.artifacts/
+
+mimic3_data/
+eICU_data/
